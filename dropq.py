@@ -39,6 +39,8 @@ else the current directory.
       --cwd DIR (inside the project)  --background  --timeout SEC (0 = none)
       --name/--note  --shell  --follow (stream output until it ends)
   dropq status                         server heartbeat, GPU, running and queued jobs
+  dropq monitor [-i SEC] [--once]      live view: server, GPU, running jobs with their latest
+                                       output line, queue, recent results (Ctrl+C to quit)
   dropq list [-p NAME] [-n 20]         recent finished jobs
   dropq show ID / follow ID / cancel ID
 
@@ -57,7 +59,7 @@ untrusted code use a separate OS account, a VM or a container.
 """
 import argparse, datetime as dt, json, os, re, shutil, signal, subprocess, sys, time, uuid
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 WIN = os.name == "nt"
 POLL = float(os.environ.get("DROPQ_POLL", "2"))   # seconds between server checks
 DEFAULT_TIMEOUT = 6 * 3600
@@ -368,9 +370,16 @@ def recover(project):
         os.remove(os.path.join(rdir, f))
 
 
+def _sigterm(signum, frame):
+    raise KeyboardInterrupt
+
+
 def serve():
+    if not WIN:
+        signal.signal(signal.SIGTERM, _sigterm)   # systemd/launchd stop -> clean shutdown
     with Lock():
         say(f"dropq {__version__} serving {ROOT} (python {sys.executable})")
+        server_started = now()
         recovered, running, gpu, gpu_t = set(), [], None, 0.0
         try:
             while True:
@@ -453,10 +462,12 @@ def serve():
                 stamp, fg_busy = now(), any(not r.job.get("background") for r in running)
                 try:
                     write_json(STATUS, dict(
-                        alive_at=stamp, pid=os.getpid(), root=ROOT, python=sys.executable, version=__version__,
+                        alive_at=stamp, started_at=server_started, pid=os.getpid(), root=ROOT,
+                        python=sys.executable, version=__version__, poll_s=POLL,
                         running=[dict(project=r.project, id=r.jid, name=r.job.get("name"),
                                       background=bool(r.job.get("background")), pid=r.proc.pid,
-                                      elapsed_s=round(time.time() - r.t0)) for r in running],
+                                      elapsed_s=round(time.time() - r.t0), timeout_s=r.timeout,
+                                      note=r.job.get("note")) for r in running],
                         queued=[f"{p}/{j}" for _, p, j in sorted(i for p in active for i in queued(p))],
                         projects={p: dict(enabled=reg[p]["enabled"]) for p in reg}, gpu=gpu), tries=1)
                 except OSError:
@@ -476,6 +487,15 @@ def serve():
             say("stopping: cancelling running jobs")
             for r in running:
                 kill_tree(r.proc); r.proc.wait(); finish(r, "interrupted", r.proc.returncode)
+            stop = now()
+            for path in [STATUS] + [os.path.join(inbox(p), "status.json") for p in load_registry()]:
+                try:
+                    st = read_json(path)
+                    st.update(stopped_at=stop, running=[])
+                    write_json(path, st)
+                except Exception:  # noqa: BLE001
+                    pass
+            say("stopped")
 
 
 # ------------------------------------------------------------------ owner commands
@@ -585,8 +605,9 @@ def status(a):
         print(f"no {STATUS} - the server has never run on {ROOT}"); return 1
     s = read_json(STATUS)
     age = (dt.datetime.now().astimezone() - dt.datetime.fromisoformat(s["alive_at"])).total_seconds()
-    alive = age < max(15, 5 * POLL)
-    print(f"server {'ALIVE' if alive else f'NOT RESPONDING (last seen {age:.0f}s ago)'} | {s['root']}")
+    alive = age < max(15, 5 * POLL) and not s.get("stopped_at")
+    state = "ALIVE" if alive else ("STOPPED" if s.get("stopped_at") else f"NOT RESPONDING (last seen {age:.0f}s ago)")
+    print(f"server {state} | {s['root']}")
     for g in s.get("gpu") or []:
         print("gpu:", ", ".join(f"{k}={v}" for k, v in g.items()))
     for r in s["running"]:
@@ -658,6 +679,185 @@ def cancel(a):
         sys.exit(f"no queued or running job {a.id}")
     open(os.path.join(inbox(p, "cancel"), a.id), "w").close()
     print("cancel requested for", f"{p}/{a.id}")
+
+
+# ------------------------------------------------------------------ live monitor
+def _enable_ansi():
+    """Turn on ANSI escape handling in the Windows console (no-op elsewhere)."""
+    if not WIN:
+        return True
+    try:
+        import ctypes
+        k = ctypes.windll.kernel32
+        h = k.GetStdHandle(-11)
+        mode = ctypes.c_uint32()
+        if not k.GetConsoleMode(h, ctypes.byref(mode)):
+            return False
+        return bool(k.SetConsoleMode(h, mode.value | 0x0004))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _dur(sec):
+    sec = int(max(0, sec))
+    if sec < 60:
+        return f"{sec}s"
+    if sec < 3600:
+        return f"{sec // 60}m{sec % 60:02d}s"
+    if sec < 86400:
+        return f"{sec // 3600}h{sec % 3600 // 60:02d}m"
+    return f"{sec // 86400}d{sec % 86400 // 3600:02d}h"
+
+
+def _age(iso):
+    try:
+        return (dt.datetime.now().astimezone() - dt.datetime.fromisoformat(iso)).total_seconds()
+    except (TypeError, ValueError):
+        return None
+
+
+def _bar(frac, width=20):
+    frac = min(max(frac, 0.0), 1.0)
+    full = int(round(frac * width))
+    return "#" * full + "." * (width - full)
+
+
+def _last_line(path):
+    for line in reversed(tail(path, 5)):
+        line = line.split("\r")[-1].strip()
+        if line and not line.startswith("### "):
+            return line
+    return ""
+
+
+def _recent_done(projects, n):
+    rows = []
+    for p in projects:
+        d = inbox(p, "done")
+        try:
+            with os.scandir(d) as it:
+                for e in it:
+                    if e.name.endswith(".json"):
+                        try:
+                            rows.append((e.stat().st_mtime, p, e.path))
+                        except OSError:
+                            pass
+        except OSError:
+            continue
+    out = []
+    for mt, p, path in sorted(rows, reverse=True)[:n]:
+        try:
+            out.append((mt, p, read_json(path)))
+        except Exception:  # noqa: BLE001
+            pass
+    return out
+
+
+def render_monitor(width, color):
+    """One frame of the monitor as a string."""
+    C = (lambda code, t: f"\x1b[{code}m{t}\x1b[0m") if color else (lambda code, t: t)
+    STATUS_COLOR = {"done": "32", "failed": "31", "timeout": "33", "cancelled": "90", "interrupted": "35"}
+    clip = lambda t: t if len(t) <= width else t[:max(0, width - 1)] + "~"  # noqa: E731
+    lines = []
+    head = f"dropq {__version__} monitor  {ROOT}"
+    stamp = dt.datetime.now().strftime("%H:%M:%S")
+    lines.append(C("1", clip(head + " " * max(1, width - len(head) - len(stamp)) + stamp)))
+    if not os.path.exists(STATUS):
+        lines.append(C("31", "server: never run on this root (no _dropq/status.json)"))
+        return "\n".join(lines)
+    try:
+        s = read_json(STATUS)
+    except Exception:  # noqa: BLE001
+        lines.append(C("33", "server: status.json is being written, retrying...")); return "\n".join(lines)
+    age = _age(s.get("alive_at")) or 1e9
+    stopped = s.get("stopped_at")
+    alive = age < max(15, 5 * float(s.get("poll_s", POLL))) and not stopped
+    up = _age(s.get("started_at"))
+    if alive:
+        srv = C("32", "ALIVE") + (f"  up {_dur(up)}" if up is not None else "")
+    elif stopped:
+        srv = C("31;1", f"STOPPED  {_dur(_age(stopped) or 0)} ago")
+    else:
+        srv = C("31;1", f"NOT RESPONDING  last heartbeat {_dur(age)} ago")
+    reg = load_registry()
+    off = [p for p, r in reg.items() if not r["enabled"]]
+    lines.append(clip(f"server  {srv}   pid {s.get('pid')}   projects {len(reg)}"
+                      + (f" ({len(off)} disabled: {', '.join(off)})" if off else "")))
+    # GPU: ask nvidia-smi directly when it is here (fresher), else use the server's snapshot
+    gpus = gpu_info() if shutil.which("nvidia-smi") else s.get("gpu")
+    for g in gpus or []:
+        if "error" in g:
+            lines.append(clip(f"gpu     {C('33', g['error'])}")); continue
+        mem = g["mem_used_mb"] / max(g["mem_total_mb"], 1)
+        lines.append(clip(f"gpu     {g['name']}  util {g['util_pct']:3d}% [{_bar(g['util_pct'] / 100, 10)}]"
+                          f"  mem {g['mem_used_mb'] / 1024:.1f}/{g['mem_total_mb'] / 1024:.1f}G [{_bar(mem, 10)}]"
+                          f"  {g['temp_c']}C"))
+    if not gpus:
+        lines.append(C("90", "gpu     none detected"))
+    lines.append("")
+    running = s.get("running", [])
+    lines.append(C("1", f"RUNNING ({len(running)})"))
+    for r in running:
+        to = r.get("timeout_s")
+        left = f"  {_dur(to - r['elapsed_s'])} left" if to else ""
+        tag = C("36", " bg") if r.get("background") else "   "
+        lines.append(clip(f" {C('33', '>')}{tag} {r['project']}/{r['id']}  {_dur(r['elapsed_s'])}{left}"))
+        last = _last_line(os.path.join(inbox(r["project"], "logs"), r["id"] + ".log"))
+        if last:
+            lines.append(C("90", clip(f"       | {last}")))
+    if not running:
+        lines.append(C("90", "  (idle)"))
+    lines.append("")
+    q = s.get("queued", [])
+    lines.append(C("1", f"QUEUED ({len(q)})"))
+    for item in q[:5]:
+        p, _, jid = item.partition("/")
+        try:
+            waited = time.time() - os.path.getmtime(os.path.join(inbox(p, "queue"), jid + ".json"))
+            w = f"  waiting {_dur(waited)}"
+        except OSError:
+            w = ""
+        lines.append(clip(f"  {item}{w}" + (C("33", "  (project disabled)") if p in off else "")))
+    if len(q) > 5:
+        lines.append(C("90", f"  ... and {len(q) - 5} more"))
+    lines.append("")
+    lines.append(C("1", "RECENT"))
+    recent = _recent_done(list(reg), 6)
+    for mt, p, r in recent:
+        st = r.get("status", "?")
+        dur = r.get("duration_s")
+        rc = r.get("returncode")
+        extra = f"  {r['error']}" if r.get("error") else ""
+        lines.append(clip(f"  {C(STATUS_COLOR.get(st, '0'), f'{st:11s}')} {p}/{r.get('id')}"
+                          f"  {'' if dur is None else _dur(dur)}"
+                          f"{'' if rc is None else f'  rc={rc}'}  {_dur(time.time() - mt)} ago{extra}"))
+    if not recent:
+        lines.append(C("90", "  (nothing yet)"))
+    lines.append("")
+    lines.append(C("90", clip("Ctrl+C to quit  |  dropq follow ID  |  dropq cancel ID")))
+    return "\n".join(lines)
+
+
+def monitor(a):
+    tty = sys.stdout.isatty()
+    color = tty and not os.environ.get("NO_COLOR") and _enable_ansi()
+    if a.once or not tty:
+        print(render_monitor(shutil.get_terminal_size((100, 40)).columns, color))
+        return 0
+    out = sys.stdout
+    out.write("\x1b[?1049h\x1b[?25l")          # alternate screen, hide cursor
+    try:
+        while True:
+            cols, rows = shutil.get_terminal_size((100, 40))
+            frame = render_monitor(cols, color).split("\n")[:rows]
+            out.write("\x1b[H" + "\n".join(f + "\x1b[K" for f in frame) + "\x1b[J")
+            out.flush()
+            time.sleep(a.interval)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        out.write("\x1b[?25h\x1b[?1049l"); out.flush()
+    return 0
 
 
 # ------------------------------------------------------------------ autostart
@@ -750,6 +950,9 @@ def main(argv=None):
     p.add_argument("--follow", action="store_true", help="stream output until the job ends")
     p.add_argument("cmd", nargs=argparse.REMAINDER)
     p = sp.add_parser("list"); p.add_argument("-p", "--project"); p.add_argument("-n", type=int, default=20)
+    p = sp.add_parser("monitor", help="live view of the server, GPU, jobs and recent results")
+    p.add_argument("-i", "--interval", type=float, default=2.0, help="seconds between refreshes")
+    p.add_argument("--once", action="store_true", help="print one frame and exit")
     for c in ("show", "follow", "cancel"):
         p = sp.add_parser(c); p.add_argument("id"); p.add_argument("-p", "--project")
         if c == "show":
@@ -759,7 +962,7 @@ def main(argv=None):
     cmds = {"serve": lambda a: serve(), "install": install, "uninstall": uninstall, "status": status,
             "projects": projects, "init": init, "enable": lambda a: set_enabled(a, True),
             "disable": lambda a: set_enabled(a, False), "submit": submit, "list": list_done, "show": show,
-            "follow": follow, "cancel": cancel}
+            "follow": follow, "cancel": cancel, "monitor": monitor}
     rc = cmds[a.c](a)
     return rc if isinstance(rc, int) else 0
 

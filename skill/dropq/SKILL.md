@@ -27,7 +27,7 @@ not in your sandbox. Treat it like running commands on their computer: useful, b
 
 ## Workflow
 
-1. **Check the server.** Read `_jobs/status.json`. If `alive_at` is more than ~30 s old, the
+1. **Check the server.** Read `_jobs/status.json`. If it has `stopped_at`, or `alive_at` is more than ~30 s old, the
    server (or the machine) is off: tell the user — jobs would just wait in the queue.
    Note `rules` (what this project may run) and `gpu`.
 2. **Submit.** Write the job as `queue/<ID>.json.tmp`, then rename it to `queue/<ID>.json`

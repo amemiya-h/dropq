@@ -33,7 +33,33 @@ The *root* is a workspace folder, e.g. `D:\Misc` or `~/work`. Set it once with `
 dropq init myproject                 # create (or register) ROOT/myproject with its own inbox
 dropq install                        # start the server at login; prints how to start it now
 dropq status                         # ALIVE, GPU usage, running and queued jobs
+dropq monitor                        # live view, refreshed every 2 s (Ctrl+C to quit)
 ```
+
+`dropq monitor` is a `top`-style view that works in any terminal, including over SSH:
+
+```
+dropq 0.3.0 monitor  D:\Misc                                                  22:03:17
+server  ALIVE  up 3h12m   pid 5828   projects 2 (1 disabled: lens)
+gpu     NVIDIA GeForce RTX 4060  util  97% [##########]  mem 3.1/8.0G [####......]  64C
+
+RUNNING (2)
+ > bg Othogo/20261007-190314-train-a314  3h02m
+       | it   210 |   48s | games  245 | loss p 2.114 v 0.412 s 0.301
+ >    Othogo/20261007-220201-analyze-0d40  1m16s  4h58m left
+       | 20  28 |   0.47   0.41  0.12 |   +0.81 ± 0.39 | -0.8
+
+QUEUED (1)
+  Othogo/20261007-220314-next-936c  waiting 1m02s
+
+RECENT
+  done        Othogo/20261007-215502-eval-5bd7  6m12s  rc=0  1m20s ago
+  failed      Othogo/20261007-214901-plot-f517  2s  rc=1  14m ago
+```
+
+It shows server health, GPU load, each running job with the latest line of its output, how
+long queued jobs have waited, and recent results. `--once` prints a single frame (handy in
+scripts), `-i` sets the refresh interval, and `NO_COLOR=1` turns colours off.
 
 Submitting, from anywhere (`-p` can be left out when you're inside the project folder):
 

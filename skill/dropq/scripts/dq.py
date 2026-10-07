@@ -52,8 +52,9 @@ def cmd_status(ib, a):
     s, age = server_status(ib)
     if s is None:
         print("no status.json - the server has not served this project yet"); return 1
-    alive = age < 30
-    print(f"server {'ALIVE' if alive else f'NOT RESPONDING (last heartbeat {age:.0f}s ago)'}"
+    alive = age < 30 and not s.get("stopped_at")
+    state = "ALIVE" if alive else ("STOPPED" if s.get("stopped_at") else f"NOT RESPONDING (last heartbeat {age:.0f}s ago)")
+    print(f"server {state}"
           f" | project {s.get('project')} {'enabled' if s.get('enabled', True) else 'DISABLED'}"
           f" | other work running: {'yes' if s.get('server_busy') else 'no'}")
     for g in s.get("gpu") or []:
@@ -135,7 +136,7 @@ def cmd_submit(ib, a):
     os.replace(q + ".tmp", q)
     print(jid, flush=True)
     s, age = server_status(ib)
-    if s is None or age > 30:
+    if s is None or age > 30 or s.get("stopped_at"):
         print("warning: the server is not responding; the job will wait in the queue", file=sys.stderr)
     if a.wait is not None:
         return wait(ib, jid, a.wait, a.tail)

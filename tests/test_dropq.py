@@ -213,3 +213,34 @@ def test_skill_helper_with_inbox_access_only(server):
     assert r.returncode == 2 and "end dq" in r.stdout and "failed rc=2" in r.stdout
     r = dq(inbox, "submit", "--wait", "30", "--", "surely-not-a-program-xyz")
     assert "not found" in r.stdout
+
+
+# ---------------------------------------------------------------- monitor
+def test_monitor_once_shows_jobs(server):
+    done = submit(server, "proj", "python", "sleep.py", "m", "0")
+    result(server, "proj", done)
+    bg = submit(server, "proj", "python", "sleep.py", "mon", "30", background=True, timeout=0)
+    log, t0 = server / "proj" / "_jobs" / "logs" / f"{bg}.log", time.time()
+    while not (log.exists() and "start mon" in log.read_text()):
+        assert time.time() - t0 < 10, "background job did not start"
+        time.sleep(0.2)
+    time.sleep(0.6)   # let the server write a heartbeat that lists it
+    out = cli(server, "monitor", "--once").stdout
+    assert "ALIVE" in out and bg in out and "start mon" in out and done in out and "RECENT" in out
+    cli(server, "cancel", bg)
+    result(server, "proj", bg)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="terminate() is not a clean shutdown on Windows")
+def test_clean_stop_is_reported(tmp_path):
+    cli(tmp_path, "init", "proj")
+    proc = subprocess.Popen([sys.executable, DROPQ, "--root", str(tmp_path), "serve"], env=ENV,
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    t0 = time.time()
+    while not (tmp_path / "proj" / "_jobs" / "status.json").exists():
+        assert time.time() - t0 < 10
+        time.sleep(0.1)
+    proc.terminate(); proc.wait(timeout=10)
+    assert "STOPPED" in cli(tmp_path, "monitor", "--once").stdout
+    assert "STOPPED" in cli(tmp_path, "status", check=False).stdout
+    assert "STOPPED" in dq(str(tmp_path / "proj"), "status").stdout
