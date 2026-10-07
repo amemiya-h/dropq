@@ -125,6 +125,12 @@ inbox, waits for `done/ID.json`, reads the result, and submits the next job — 
 machine as a compute server without you relaying anything, and without being able to touch
 other projects' queues or the server's rules.
 
+[`skill/dropq/`](skill/dropq) is a ready-made skill that teaches Claude this workflow:
+`SKILL.md` covers the inbox format, the submit–wait–read loop, the rules and etiquette, and
+`scripts/dq.py` is a small helper that drives an inbox with nothing but file access
+(`python dq.py <project> submit --wait 600 -- python train.py`). To use it with Claude, zip the
+`skill/dropq` folder and add it as a skill, or copy it into your skills directory.
+
 ## Security
 
 dropq decides **which** jobs start, **where** and **how**. It is **not a sandbox**: a job runs

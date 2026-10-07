@@ -196,3 +196,20 @@ def test_symlink_out_of_project_rejected(server):
     os.symlink(server / "proj", server / "other" / "link")
     drop(server, "other", "via-link", {"cmd": ["python", "-c", "1"], "cwd": "link"})
     assert "outside the project" in result(server, "other", "via-link")["error"]
+
+
+# ---------------------------------------------------------------- the skill's inbox helper
+DQ = os.path.join(os.path.dirname(DROPQ), "skill", "dropq", "scripts", "dq.py")
+
+
+def dq(*args):
+    return subprocess.run([sys.executable, DQ, *args], capture_output=True, text=True, timeout=60)
+
+
+def test_skill_helper_with_inbox_access_only(server):
+    inbox = str(server / "proj")
+    assert "ALIVE" in dq(inbox, "status").stdout
+    r = dq(inbox, "submit", "--name", "viadq", "--wait", "30", "--", "python", "sleep.py", "dq", "0", "2")
+    assert r.returncode == 2 and "end dq" in r.stdout and "failed rc=2" in r.stdout
+    r = dq(inbox, "submit", "--wait", "30", "--", "surely-not-a-program-xyz")
+    assert "not found" in r.stdout
