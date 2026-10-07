@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dropq"
+dynamic = ["version"]
+description = "Drop a job file in a folder; the machine runs it. A tiny file-based job server."
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.8"
+keywords = ["job queue", "job server", "gpu", "ssh", "remote execution"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: Microsoft :: Windows",
+  "Operating System :: POSIX :: Linux",
+  "Operating System :: MacOS",
+  "Topic :: System :: Distributed Computing",
+]
+
+[project.scripts]
+dropq = "dropq:main"
+
+[tool.setuptools]
+py-modules = ["dropq"]
+
+[tool.setuptools.dynamic]
+version = { attr = "dropq.__version__" }
