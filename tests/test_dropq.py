@@ -227,8 +227,18 @@ def test_monitor_once_shows_jobs(server):
     time.sleep(0.6)   # let the server write a heartbeat that lists it
     out = cli(server, "monitor", "--once").stdout
     assert "ALIVE" in out and bg in out and "start mon" in out and done in out and "RECENT" in out
+    assert "disk " in out
+    if sys.platform != "darwin":          # macOS without psutil only has load and disk
+        assert "cpu " in out and "mem " in out
     cli(server, "cancel", bg)
     result(server, "proj", bg)
+
+
+def test_monitor_without_psutil_falls_back(server):
+    env = dict(ENV, DROPQ_NO_PSUTIL="1")
+    out = subprocess.run([sys.executable, DROPQ, "--root", str(server), "monitor", "--once"], env=env,
+                         capture_output=True, text=True, timeout=60)
+    assert out.returncode == 0 and "Traceback" not in out.stderr and "disk " in out.stdout
 
 
 @pytest.mark.skipif(os.name == "nt", reason="terminate() is not a clean shutdown on Windows")

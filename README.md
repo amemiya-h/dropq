@@ -39,14 +39,19 @@ dropq monitor                        # live view, refreshed every 2 s (Ctrl+C to
 `dropq monitor` is a `top`-style view that works in any terminal, including over SSH:
 
 ```
-dropq 0.3.0 monitor  D:\Misc                                                  22:03:17
+dropq 0.4.0 monitor  D:\Misc                                                  22:03:17
 server  ALIVE  up 3h12m   pid 5828   projects 2 (1 disabled: lens)
-gpu     NVIDIA GeForce RTX 4060  util  97% [##########]  mem 3.1/8.0G [####......]  64C
+host    up 5d02h   load 1.92 1.40 1.11   312 procs   16 cpus
+cpu     [##########............]  46%   cores |@*#=-..:@%#+:. .|
+mem     [#########.............]  41%  13.1G/31.7G   swap 0.2G/4.0G
+disk    [##########............]  44%  412.3G/931.5G   read 12.3M/s  write 1.1M/s
+net     down 1.2M/s   up 230.4K/s
+gpu     [#####################.]  97%  NVIDIA GeForce RTX 4060   vram 3.1/8.0G (39%)   64C
 
 RUNNING (2)
- > bg Othogo/20261007-190314-train-a314  3h02m
+ > bg Othogo/20261007-190314-train-a314  3h02m   cpu 104%  mem 2.3G  vram 2.6G
        | it   210 |   48s | games  245 | loss p 2.114 v 0.412 s 0.301
- >    Othogo/20261007-220201-analyze-0d40  1m16s  4h58m left
+ >    Othogo/20261007-220201-analyze-0d40  1m16s  4h58m left   cpu 99%  mem 1.1G  vram 0.4G
        | 20  28 |   0.47   0.41  0.12 |   +0.81 ± 0.39 | -0.8
 
 QUEUED (1)
@@ -57,28 +62,24 @@ RECENT
   failed      Othogo/20261007-214901-plot-f517  2s  rc=1  14m ago
 ```
 
-It shows server health, GPU load, each running job with the latest line of its output, how
-long queued jobs have waited, and recent results. `--once` prints a single frame (handy in
-scripts), `-i` sets the refresh interval, and `NO_COLOR=1` turns colours off.
+It shows the machine (uptime, load, CPU per core, memory, swap, disk space and I/O, network),
+the GPU, each running job with its own CPU, memory and GPU memory (summed over any processes it
+starts) and the latest line of its output, how long queued jobs have waited, and recent
+results. The host figures describe the machine the monitor runs on — over SSH, the server.
 
-Submitting, from anywhere (`-p` can be left out when you're inside the project folder):
+`--once` prints a single frame (handy in scripts), `-i` sets the refresh interval, and
+`NO_COLOR=1` turns colours off.
 
-```
-dropq submit -p myproject -- python train.py --epochs 10
-dropq submit -p myproject --background --timeout 0 --name train -- python train.py --resume
-dropq submit -p myproject --follow -- python evaluate.py      # stream output until it ends
-dropq list -p myproject
-dropq show 20261007-165111-train-9150
-dropq follow 20261007-165111-train-9150
-dropq cancel 20261007-165111-train-9150
-```
-
-Over SSH (for example through [Tailscale](https://tailscale.com)):
+dropq itself needs nothing beyond the standard library. For the full set of figures on every
+system, install [psutil](https://pypi.org/project/psutil/) too:
 
 ```
-ssh desktop dropq submit -p myproject --background -- python train.py
-ssh desktop dropq status
+pip install "dropq[monitor] @ git+https://github.com/amemiya-h/dropq"
 ```
+
+Without psutil the monitor shows what the operating system offers directly: everything on
+Linux; CPU, memory and disk space on Windows; load and disk space on macOS. Per-job GPU memory
+needs a driver that reports it (on Windows it often doesn't).
 
 ## Layout
 

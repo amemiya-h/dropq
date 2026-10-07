@@ -14,4 +14,6 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
       - run: pip install pytest
+      - if: matrix.python == '3.12'
+        run: pip install psutil     # the other versions test the monitor's psutil-free fallbacks
       - run: python -m pytest -q

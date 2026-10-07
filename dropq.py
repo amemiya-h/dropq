@@ -59,7 +59,7 @@ untrusted code use a separate OS account, a VM or a container.
 """
 import argparse, datetime as dt, json, os, re, shutil, signal, subprocess, sys, time, uuid
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 WIN = os.name == "nt"
 POLL = float(os.environ.get("DROPQ_POLL", "2"))   # seconds between server checks
 DEFAULT_TIMEOUT = 6 * 3600
@@ -716,10 +716,25 @@ def _age(iso):
         return None
 
 
+def _size(n, rate=False):
+    n = float(n)
+    for unit in ("B", "K", "M", "G", "T"):
+        if abs(n) < 1024 or unit == "T":
+            s = f"{n:.0f}{unit}" if unit == "B" else f"{n:.1f}{unit}"
+            return s + ("/s" if rate else "")
+        n /= 1024
+
+
 def _bar(frac, width=20):
     frac = min(max(frac, 0.0), 1.0)
     full = int(round(frac * width))
     return "#" * full + "." * (width - full)
+
+
+def _spark(fracs):
+    """One character per core: ' ' idle .. '@' busy."""
+    levels = " .:-=+*#%@"
+    return "".join(levels[min(len(levels) - 1, int(round(min(max(f, 0), 1) * (len(levels) - 1))))] for f in fracs)
 
 
 def _last_line(path):
@@ -733,9 +748,8 @@ def _last_line(path):
 def _recent_done(projects, n):
     rows = []
     for p in projects:
-        d = inbox(p, "done")
         try:
-            with os.scandir(d) as it:
+            with os.scandir(inbox(p, "done")) as it:
                 for e in it:
                     if e.name.endswith(".json"):
                         try:
@@ -753,55 +767,359 @@ def _recent_done(projects, n):
     return out
 
 
-def render_monitor(width, color):
+def _gpu_procs():
+    """{pid: used GPU memory in MiB} from nvidia-smi (empty if unavailable)."""
+    exe = shutil.which("nvidia-smi")
+    if not exe:
+        return {}
+    try:
+        out = subprocess.run([exe, "--query-compute-apps=pid,used_memory", "--format=csv,noheader,nounits"],
+                             capture_output=True, text=True, timeout=10,
+                             creationflags=subprocess.CREATE_NO_WINDOW if WIN else 0).stdout
+    except Exception:  # noqa: BLE001
+        return {}
+    res = {}
+    for line in out.splitlines():
+        parts = [x.strip() for x in line.split(",")]
+        if len(parts) == 2 and parts[0].isdigit():
+            try:
+                res[int(parts[0])] = res.get(int(parts[0]), 0) + float(parts[1])
+            except ValueError:
+                pass      # "[N/A]" on some Windows drivers
+    return res
+
+
+class SystemStats:
+    """Host and per-job resource usage. Uses psutil when installed, else what the OS offers.
+
+    sample() returns a dict; rates and CPU percentages are measured since the previous sample.
+    """
+
+    def __init__(self, disk_path):
+        self.disk_path = disk_path
+        self.prev_t = None
+        self.prev = {}
+        self.procs = {}          # psutil.Process cache, so per-process cpu_percent has a baseline
+        try:
+            if os.environ.get("DROPQ_NO_PSUTIL"):
+                raise ImportError
+            import psutil
+            self.ps = psutil
+            psutil.cpu_percent(percpu=True)
+        except ImportError:
+            self.ps = None
+        self.backend = "psutil" if self.ps else ("proc" if os.path.exists("/proc/stat") else
+                                                 "windows" if WIN else "basic")
+
+    # ---- helpers for the /proc backend
+    @staticmethod
+    def _proc_cpu_times():
+        cores, total = [], None
+        with open("/proc/stat") as fh:
+            for line in fh:
+                f = line.split()
+                if not f or not f[0].startswith("cpu"):
+                    break
+                vals = [int(x) for x in f[1:]]
+                entry = (sum(vals), vals[3] + (vals[4] if len(vals) > 4 else 0))   # (all, idle+iowait)
+                if f[0] == "cpu":
+                    total = entry
+                else:
+                    cores.append(entry)
+        return total, cores
+
+    @staticmethod
+    def _proc_tree_stats():
+        """pid -> (ppid, cpu ticks, rss bytes) for every process."""
+        page = os.sysconf("SC_PAGE_SIZE") if hasattr(os, "sysconf") else 4096
+        res = {}
+        for d in os.listdir("/proc"):
+            if not d.isdigit():
+                continue
+            try:
+                with open(f"/proc/{d}/stat") as fh:
+                    st = fh.read()
+                rest = st[st.rindex(")") + 2:].split()
+                res[int(d)] = (int(rest[1]), int(rest[11]) + int(rest[12]), int(rest[21]) * page)
+            except (OSError, ValueError, IndexError):
+                pass
+        return res
+
+    def _rate(self, key, value, dt_s):
+        prev = self.prev.get(key)
+        self.prev[key] = value
+        if prev is None or dt_s <= 0:
+            return None
+        return max(0.0, (value - prev) / dt_s)
+
+    def sample(self, job_pids=()):
+        t = time.time()
+        dt_s = t - self.prev_t if self.prev_t else 0.0
+        self.prev_t = t
+        s = dict(backend=self.backend, cpu=None, cores=None, mem=None, swap=None, load=None, uptime=None,
+                 procs=None, disk=None, disk_io=None, net=None, jobs={})
+        try:
+            u = shutil.disk_usage(self.disk_path)
+            s["disk"] = (u.used, u.total)
+        except OSError:
+            pass
+        if hasattr(os, "getloadavg"):
+            try:
+                s["load"] = os.getloadavg()
+            except OSError:
+                pass
+        s["ncpu"] = os.cpu_count()
+        if self.ps:
+            self._sample_psutil(s, dt_s, job_pids)
+        elif self.backend == "proc":
+            self._sample_proc(s, dt_s, job_pids)
+        elif self.backend == "windows":
+            self._sample_windows(s, dt_s)
+        return s
+
+    def _sample_psutil(self, s, dt_s, job_pids):
+        ps = self.ps
+        cores = ps.cpu_percent(percpu=True)
+        s["cores"] = [c / 100 for c in cores]
+        s["cpu"] = sum(cores) / max(len(cores), 1) / 100
+        vm, sw = ps.virtual_memory(), ps.swap_memory()
+        s["mem"] = (vm.total - vm.available, vm.total)
+        s["swap"] = (sw.used, sw.total)
+        try:
+            s["load"] = ps.getloadavg()
+        except (AttributeError, OSError):
+            pass
+        s["uptime"] = time.time() - ps.boot_time()
+        s["procs"] = len(ps.pids())
+        try:
+            io = ps.disk_io_counters()
+            if io:
+                s["disk_io"] = (self._rate("dr", io.read_bytes, dt_s), self._rate("dw", io.write_bytes, dt_s))
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            n = ps.net_io_counters()
+            s["net"] = (self._rate("rx", n.bytes_recv, dt_s), self._rate("tx", n.bytes_sent, dt_s))
+        except Exception:  # noqa: BLE001
+            pass
+        alive = set()
+        for jp in job_pids:
+            cpu = rss = 0.0
+            pids = []
+            try:
+                root = self.procs.get(jp) or self.procs.setdefault(jp, ps.Process(jp))
+                tree = [root] + root.children(recursive=True)
+            except ps.Error:
+                continue
+            for p in tree:
+                p = self.procs.setdefault(p.pid, p)
+                alive.add(p.pid)
+                try:
+                    cpu += p.cpu_percent(None) / 100
+                    rss += p.memory_info().rss
+                    pids.append(p.pid)
+                except ps.Error:
+                    pass
+            s["jobs"][jp] = dict(cpu=cpu if dt_s else None, rss=rss, nproc=len(pids), pids=pids)
+        for pid in list(self.procs):
+            if pid not in alive and pid not in job_pids:
+                del self.procs[pid]
+
+    def _sample_proc(self, s, dt_s, job_pids):
+        total, cores = self._proc_cpu_times()
+        pt, pc = self.prev.get("cpu_total"), self.prev.get("cpu_cores")
+        self.prev["cpu_total"], self.prev["cpu_cores"] = total, cores
+        if pt and pc and len(pc) == len(cores):
+            frac = lambda a, b: 1 - (a[1] - b[1]) / max(a[0] - b[0], 1)  # noqa: E731
+            s["cpu"] = frac(total, pt)
+            s["cores"] = [frac(a, b) for a, b in zip(cores, pc)]
+        info = {}
+        with open("/proc/meminfo") as fh:
+            for line in fh:
+                k, v = line.split(":", 1)
+                info[k] = int(v.split()[0]) * 1024
+        tot = info.get("MemTotal", 0)
+        s["mem"] = (tot - info.get("MemAvailable", info.get("MemFree", 0)), tot)
+        s["swap"] = (info.get("SwapTotal", 0) - info.get("SwapFree", 0), info.get("SwapTotal", 0))
+        try:
+            with open("/proc/uptime") as fh:
+                s["uptime"] = float(fh.read().split()[0])
+        except OSError:
+            pass
+        try:
+            blocks = {d for d in os.listdir("/sys/block") if not d.startswith(("loop", "ram", "zram", "dm-"))}
+            rd = wr = 0
+            with open("/proc/diskstats") as fh:
+                for line in fh:
+                    f = line.split()
+                    if len(f) > 9 and f[2] in blocks:
+                        rd += int(f[5]) * 512; wr += int(f[9]) * 512
+            s["disk_io"] = (self._rate("dr", rd, dt_s), self._rate("dw", wr, dt_s))
+        except OSError:
+            pass
+        try:
+            rx = tx = 0
+            with open("/proc/net/dev") as fh:
+                for line in fh.readlines()[2:]:
+                    name, data = line.split(":", 1)
+                    if name.strip() != "lo":
+                        f = data.split(); rx += int(f[0]); tx += int(f[8])
+            s["net"] = (self._rate("rx", rx, dt_s), self._rate("tx", tx, dt_s))
+        except OSError:
+            pass
+        allp = self._proc_tree_stats()
+        s["procs"] = len(allp)
+        kids = {}
+        for pid, (ppid, _, _) in allp.items():
+            kids.setdefault(ppid, []).append(pid)
+        hz = os.sysconf("SC_CLK_TCK") if hasattr(os, "sysconf") else 100
+        prev_ticks = self.prev.get("ticks", {})
+        ticks_now = {}
+        for jp in job_pids:
+            if jp not in allp:
+                continue
+            tree, stack = [], [jp]
+            while stack:
+                p = stack.pop(); tree.append(p); stack.extend(kids.get(p, []))
+            cpu, rss = 0.0, 0
+            for p in tree:
+                _, ticks, r = allp[p]
+                ticks_now[p] = ticks
+                rss += r
+                if dt_s and p in prev_ticks:
+                    cpu += (ticks - prev_ticks[p]) / hz / dt_s
+            s["jobs"][jp] = dict(cpu=cpu if dt_s and jp in prev_ticks else None, rss=rss, nproc=len(tree),
+                                 pids=tree)
+        self.prev["ticks"] = ticks_now
+
+    def _sample_windows(self, s, dt_s):
+        import ctypes
+        from ctypes import wintypes
+        k = ctypes.windll.kernel32
+        idle, kern, user = wintypes.FILETIME(), wintypes.FILETIME(), wintypes.FILETIME()
+        if k.GetSystemTimes(ctypes.byref(idle), ctypes.byref(kern), ctypes.byref(user)):
+            v = lambda ft: (ft.dwHighDateTime << 32) | ft.dwLowDateTime  # noqa: E731
+            cur = (v(kern) + v(user), v(idle))       # kernel time includes idle time
+            prev = self.prev.get("cpu_total")
+            self.prev["cpu_total"] = cur
+            if prev:
+                s["cpu"] = 1 - (cur[1] - prev[1]) / max(cur[0] - prev[0], 1)
+
+        class MEMSTAT(ctypes.Structure):
+            _fields_ = [("dwLength", wintypes.DWORD), ("dwMemoryLoad", wintypes.DWORD),
+                        ("ullTotalPhys", ctypes.c_uint64), ("ullAvailPhys", ctypes.c_uint64),
+                        ("ullTotalPageFile", ctypes.c_uint64), ("ullAvailPageFile", ctypes.c_uint64),
+                        ("ullTotalVirtual", ctypes.c_uint64), ("ullAvailVirtual", ctypes.c_uint64),
+                        ("ullAvailExtendedVirtual", ctypes.c_uint64)]
+        m = MEMSTAT(); m.dwLength = ctypes.sizeof(MEMSTAT)
+        if k.GlobalMemoryStatusEx(ctypes.byref(m)):
+            s["mem"] = (m.ullTotalPhys - m.ullAvailPhys, m.ullTotalPhys)
+        try:
+            k.GetTickCount64.restype = ctypes.c_uint64
+            s["uptime"] = k.GetTickCount64() / 1000
+        except AttributeError:
+            pass
+
+
+def render_monitor(width, color, stats=None, sample=None, gpu_mem=None):
     """One frame of the monitor as a string."""
     C = (lambda code, t: f"\x1b[{code}m{t}\x1b[0m") if color else (lambda code, t: t)
     STATUS_COLOR = {"done": "32", "failed": "31", "timeout": "33", "cancelled": "90", "interrupted": "35"}
     clip = lambda t: t if len(t) <= width else t[:max(0, width - 1)] + "~"  # noqa: E731
+    pct = lambda f: "  -" if f is None else f"{f * 100:3.0f}%"  # noqa: E731
+    bw = max(10, min(30, width // 5))
     lines = []
     head = f"dropq {__version__} monitor  {ROOT}"
     stamp = dt.datetime.now().strftime("%H:%M:%S")
     lines.append(C("1", clip(head + " " * max(1, width - len(head) - len(stamp)) + stamp)))
-    if not os.path.exists(STATUS):
-        lines.append(C("31", "server: never run on this root (no _dropq/status.json)"))
-        return "\n".join(lines)
-    try:
-        s = read_json(STATUS)
-    except Exception:  # noqa: BLE001
-        lines.append(C("33", "server: status.json is being written, retrying...")); return "\n".join(lines)
-    age = _age(s.get("alive_at")) or 1e9
-    stopped = s.get("stopped_at")
-    alive = age < max(15, 5 * float(s.get("poll_s", POLL))) and not stopped
-    up = _age(s.get("started_at"))
-    if alive:
-        srv = C("32", "ALIVE") + (f"  up {_dur(up)}" if up is not None else "")
-    elif stopped:
-        srv = C("31;1", f"STOPPED  {_dur(_age(stopped) or 0)} ago")
+    s = None
+    if os.path.exists(STATUS):
+        try:
+            s = read_json(STATUS)
+        except Exception:  # noqa: BLE001
+            lines.append(C("33", "server  status.json is being written, retrying..."))
     else:
-        srv = C("31;1", f"NOT RESPONDING  last heartbeat {_dur(age)} ago")
+        lines.append(C("31", "server  never run on this root (no _dropq/status.json)"))
     reg = load_registry()
     off = [p for p, r in reg.items() if not r["enabled"]]
-    lines.append(clip(f"server  {srv}   pid {s.get('pid')}   projects {len(reg)}"
-                      + (f" ({len(off)} disabled: {', '.join(off)})" if off else "")))
-    # GPU: ask nvidia-smi directly when it is here (fresher), else use the server's snapshot
-    gpus = gpu_info() if shutil.which("nvidia-smi") else s.get("gpu")
+    if s is not None:
+        age = _age(s.get("alive_at")) or 1e9
+        stopped = s.get("stopped_at")
+        alive = age < max(15, 5 * float(s.get("poll_s", POLL))) and not stopped
+        up = _age(s.get("started_at"))
+        if alive:
+            srv = C("32", "ALIVE") + (f"  up {_dur(up)}" if up is not None else "")
+        elif stopped:
+            srv = C("31;1", f"STOPPED  {_dur(_age(stopped) or 0)} ago")
+        else:
+            srv = C("31;1", f"NOT RESPONDING  last heartbeat {_dur(age)} ago")
+        lines.append(clip(f"server  {srv}   pid {s.get('pid')}   projects {len(reg)}"
+                          + (f" ({len(off)} disabled: {', '.join(off)})" if off else "")))
+
+    # ---- host
+    m = sample or {}
+    if m:
+        host = []
+        if m.get("uptime") is not None:
+            host.append(f"up {_dur(m['uptime'])}")
+        if m.get("load"):
+            host.append("load " + " ".join(f"{x:.2f}" for x in m["load"]))
+        if m.get("procs"):
+            host.append(f"{m['procs']} procs")
+        host.append(f"{m.get('ncpu')} cpus")
+        lines.append(clip("host    " + "   ".join(host)))
+        if m.get("cpu") is not None:
+            lines.append(clip(f"cpu     [{_bar(m['cpu'], bw)}] {pct(m['cpu'])}"
+                              + (f"   cores |{_spark(m['cores'])}|" if m.get("cores") else "")))
+        if m.get("mem"):
+            used, tot = m["mem"]
+            line = f"mem     [{_bar(used / max(tot, 1), bw)}] {pct(used / max(tot, 1))}  {_size(used)}/{_size(tot)}"
+            if m.get("swap") and m["swap"][1]:
+                line += f"   swap {_size(m['swap'][0])}/{_size(m['swap'][1])}"
+            lines.append(clip(line))
+        if m.get("disk"):
+            used, tot = m["disk"]
+            line = f"disk    [{_bar(used / max(tot, 1), bw)}] {pct(used / max(tot, 1))}  {_size(used)}/{_size(tot)}"
+            if m.get("disk_io") and m["disk_io"][0] is not None:
+                line += f"   read {_size(m['disk_io'][0], True)}  write {_size(m['disk_io'][1], True)}"
+            lines.append(clip(line))
+        if m.get("net") and m["net"][0] is not None:
+            lines.append(clip(f"net     down {_size(m['net'][0], True)}   up {_size(m['net'][1], True)}"))
+        if m.get("backend") in ("windows", "basic"):
+            lines.append(C("90", clip("        (pip install psutil for network, disk I/O, swap and per-job usage)")))
+
+    # ---- GPU: ask nvidia-smi directly when it is here (fresher), else use the server's snapshot
+    gpus = gpu_info() if shutil.which("nvidia-smi") else (s or {}).get("gpu")
     for g in gpus or []:
         if "error" in g:
             lines.append(clip(f"gpu     {C('33', g['error'])}")); continue
-        mem = g["mem_used_mb"] / max(g["mem_total_mb"], 1)
-        lines.append(clip(f"gpu     {g['name']}  util {g['util_pct']:3d}% [{_bar(g['util_pct'] / 100, 10)}]"
-                          f"  mem {g['mem_used_mb'] / 1024:.1f}/{g['mem_total_mb'] / 1024:.1f}G [{_bar(mem, 10)}]"
-                          f"  {g['temp_c']}C"))
+        memf = g["mem_used_mb"] / max(g["mem_total_mb"], 1)
+        lines.append(clip(f"gpu     [{_bar(g['util_pct'] / 100, bw)}] {g['util_pct']:3d}%  {g['name']}"
+                          f"   vram {g['mem_used_mb'] / 1024:.1f}/{g['mem_total_mb'] / 1024:.1f}G"
+                          f" ({memf * 100:.0f}%)   {g['temp_c']}C"))
     if not gpus:
         lines.append(C("90", "gpu     none detected"))
     lines.append("")
+    if s is None:
+        return "\n".join(lines)
+
+    # ---- jobs
     running = s.get("running", [])
     lines.append(C("1", f"RUNNING ({len(running)})"))
     for r in running:
         to = r.get("timeout_s")
         left = f"  {_dur(to - r['elapsed_s'])} left" if to else ""
         tag = C("36", " bg") if r.get("background") else "   "
-        lines.append(clip(f" {C('33', '>')}{tag} {r['project']}/{r['id']}  {_dur(r['elapsed_s'])}{left}"))
+        usage = ""
+        j = m.get("jobs", {}).get(r.get("pid")) if m else None
+        if j:
+            usage = f"   cpu {pct(j['cpu']).strip()}  mem {_size(j['rss'])}"
+            if j["nproc"] > 1:
+                usage += f"  {j['nproc']} procs"
+            g = sum((gpu_mem or {}).get(p, 0) for p in j["pids"])
+            if g:
+                usage += f"  vram {g / 1024:.1f}G"
+        lines.append(clip(f" {C('33', '>')}{tag} {r['project']}/{r['id']}  {_dur(r['elapsed_s'])}{left}{usage}"))
         last = _last_line(os.path.join(inbox(r["project"], "logs"), r["id"] + ".log"))
         if last:
             lines.append(C("90", clip(f"       | {last}")))
@@ -813,8 +1131,7 @@ def render_monitor(width, color):
     for item in q[:5]:
         p, _, jid = item.partition("/")
         try:
-            waited = time.time() - os.path.getmtime(os.path.join(inbox(p, "queue"), jid + ".json"))
-            w = f"  waiting {_dur(waited)}"
+            w = f"  waiting {_dur(time.time() - os.path.getmtime(os.path.join(inbox(p, 'queue'), jid + '.json')))}"
         except OSError:
             w = ""
         lines.append(clip(f"  {item}{w}" + (C("33", "  (project disabled)") if p in off else "")))
@@ -825,8 +1142,7 @@ def render_monitor(width, color):
     recent = _recent_done(list(reg), 6)
     for mt, p, r in recent:
         st = r.get("status", "?")
-        dur = r.get("duration_s")
-        rc = r.get("returncode")
+        dur, rc = r.get("duration_s"), r.get("returncode")
         extra = f"  {r['error']}" if r.get("error") else ""
         lines.append(clip(f"  {C(STATUS_COLOR.get(st, '0'), f'{st:11s}')} {p}/{r.get('id')}"
                           f"  {'' if dur is None else _dur(dur)}"
@@ -838,18 +1154,30 @@ def render_monitor(width, color):
     return "\n".join(lines)
 
 
+def _job_pids():
+    try:
+        return [r["pid"] for r in read_json(STATUS).get("running", []) if r.get("pid")]
+    except Exception:  # noqa: BLE001
+        return []
+
+
 def monitor(a):
     tty = sys.stdout.isatty()
     color = tty and not os.environ.get("NO_COLOR") and _enable_ansi()
+    stats = SystemStats(ROOT)
+    stats.sample(_job_pids())                       # baseline for rates and CPU percentages
     if a.once or not tty:
-        print(render_monitor(shutil.get_terminal_size((100, 40)).columns, color))
+        time.sleep(0.5)
+        print(render_monitor(shutil.get_terminal_size((100, 40)).columns, color,
+                             stats, stats.sample(_job_pids()), _gpu_procs()))
         return 0
     out = sys.stdout
     out.write("\x1b[?1049h\x1b[?25l")          # alternate screen, hide cursor
     try:
+        time.sleep(min(a.interval, 0.5))
         while True:
             cols, rows = shutil.get_terminal_size((100, 40))
-            frame = render_monitor(cols, color).split("\n")[:rows]
+            frame = render_monitor(cols, color, stats, stats.sample(_job_pids()), _gpu_procs()).split("\n")[:rows]
             out.write("\x1b[H" + "\n".join(f + "\x1b[K" for f in frame) + "\x1b[J")
             out.flush()
             time.sleep(a.interval)
