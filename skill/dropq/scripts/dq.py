@@ -8,6 +8,7 @@ by reading and writing files. Standard library only.
 
   python dq.py INBOX status
   python dq.py INBOX submit [--cwd DIR] [--name N] [--note T] [--background] [--timeout SEC]
+                            [--commit SHA] [--artifact GLOB] [--not-after TIME]
                             [--wait SEC] -- CMD ARG ...
   python dq.py INBOX wait ID [--timeout SEC] [--tail N]     exit code = the job's
   python dq.py INBOX show ID [--tail N]
@@ -63,6 +64,12 @@ def cmd_status(ib, a):
         print(f"running: {r['id']} {'[bg] ' if r.get('background') else ''}{r.get('elapsed_s')}s")
     print("queued:", ", ".join(s.get("queued", [])) or "none")
     print("rules:", json.dumps(s.get("rules", {})))
+    rm = s.get("remote")
+    if rm:
+        print(f"remote: runs on {rm.get('host')} via link {rm.get('link')} {'up' if rm.get('link_up') else 'DOWN'}"
+              + (f", {rm['waiting_to_send']} job(s) waiting to be sent" if rm.get("waiting_to_send") else "")
+              + ("" if rm.get("link_up") else f" - {rm.get('link_error')} (last contact {rm.get('last_contact')})")
+              + ("" if not rm.get("link_up") or rm.get("server_alive") else " - its dropq server is not running"))
     return 0 if alive else 1
 
 
@@ -129,6 +136,9 @@ def cmd_submit(ib, a):
     job = dict(cmd=cmd, cwd=a.cwd, background=a.background, name=a.name, note=a.note,
                timeout_s=None if a.timeout == 0 else a.timeout,
                submitted_at=dt.datetime.now().astimezone().isoformat(timespec="seconds"))
+    for k, v in (("commit", a.commit), ("artifacts", a.artifact), ("not_after", a.not_after)):
+        if v:
+            job[k] = v
     jid = new_id(a.name or os.path.basename(cmd[1] if len(cmd) > 1 else cmd[0]))
     q = os.path.join(ib, "queue", jid + ".json")
     with open(q + ".tmp", "w", encoding="utf-8") as fh:
@@ -175,6 +185,9 @@ def main():
     p.add_argument("--timeout", type=int, default=6 * 3600, help="seconds, 0 = none")
     p.add_argument("--wait", type=int, metavar="SEC", help="wait up to SEC for the result (0 = forever)")
     p.add_argument("--tail", type=int, default=30)
+    p.add_argument("--commit", help="run in a checkout of the project's repo at this commit")
+    p.add_argument("--artifact", action="append", metavar="GLOB", help="files to copy back over a link")
+    p.add_argument("--not-after", metavar="TIME", help="don't start after this ISO date-time")
     p.add_argument("cmd", nargs=argparse.REMAINDER)
     p = sp.add_parser("wait"); p.add_argument("id"); p.add_argument("--timeout", type=int, default=600)
     p.add_argument("--tail", type=int, default=30)

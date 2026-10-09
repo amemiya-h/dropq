@@ -15,6 +15,9 @@ can read back.
   the connection doesn't kill a 10-hour training run (a common problem on Windows).
 - **Plain files as the API.** Anything that can write a file can submit a job and read the result.
 - **Windows, Linux and macOS**, with one-command autostart at login.
+- **Remote machines over ssh.** Submit on a laptop, run on the desktop at home: dropq on both
+  ends relays jobs, logs and results over one ssh connection, set up with a key file you carry
+  over on a USB stick ([below](#running-jobs-on-another-machine)).
 
 ## Install
 
@@ -89,6 +92,8 @@ ROOT/
     projects.json         registered projects and their rules
     status.json           heartbeat for the whole server
     server.log            what the server did
+    clients.json          machines paired with `dropq pair` (on B)
+    links/NAME/           link to another machine: key, pinned host key, state (on A)
   myproject/
     _jobs/                the project's inbox
       queue/ID.json       ← write here to submit
@@ -97,6 +102,8 @@ ROOT/
       logs/ID.log         full stdout + stderr
       cancel/ID           create to cancel a job
       status.json         heartbeat as this project sees it (only its own jobs)
+      artifacts/ID/       files copied back over a link (on A)
+    _src/                 checkouts for commit jobs
     ...your files...
 ```
 
@@ -119,6 +126,10 @@ A job file:
 - Foreground jobs run one at a time across all projects, in submission order. `background`
   jobs start immediately and don't hold up the queue — use them for long runs.
 - `env` adds environment variables (if the project allows it).
+- `commit` runs the job in a checkout of the project's git repo at that commit (see below).
+- `not_after` (an ISO date-time) — don't start the job after this time; it fails as expired.
+- `artifacts` — globs, relative to the job's folder, of files a [link](#running-jobs-on-another-machine)
+  copies back when the job ends.
 
 Write the file as `ID.json.tmp` and rename it to `ID.json`, so the server never reads half a
 file (`dropq submit` does this). IDs use letters, digits, `_`, `.` and `-`. The result appears
@@ -144,6 +155,75 @@ Running `init` again on an existing project updates only the rules you pass.
 Programs are resolved by the server: `python`/`python3`/`py` means the server's own Python,
 other names are looked up on the server's `PATH` (never inside the project, so a file in the
 project can't stand in for `git`), and paths like `./run.sh` must point inside the project.
+
+### Jobs at a commit
+
+Give a project a git repo and jobs can name a commit to run at:
+
+```
+dropq init NAME --repo https://github.com/you/project      # on the machine that runs the jobs
+dropq submit -p NAME --commit 3f2a9c1e... -- python train.py
+```
+
+The server fetches the commit into `NAME/_src/` and runs the job in a worktree for it
+(`NAME/_src/<first 12 hex digits>/`, reused by later jobs at the same commit), so every run is
+tied to exact code. Only the owner sets the repo; a job can only pick the commit. Fetching uses
+the server user's own git credentials, e.g. a read-only deploy key for a private repo. Use the
+full hash when you can: then only that commit is fetched.
+
+## Running jobs on another machine
+
+Run dropq on both machines. On **B** (the one with the GPU) projects work as usual. On **A**
+(say a laptop), a *link* makes some projects remote: jobs written into their inbox are sent to
+B, and B's status, running jobs, logs, results and artifacts come back into the same inbox.
+Anything that drives an inbox — `dropq submit`, the skill's `dq.py`, an AI assistant with
+access to the folder — works on A unchanged.
+
+The link is a single ssh connection that A keeps open (reconnecting with backoff). B keeps the
+queue and the rules: if the link drops, running jobs carry on, new jobs wait on A, and
+everything catches up when it's back. Code travels through git (see `commit` above), not the link.
+
+**On B** — needs an ssh server (on Windows: *Settings → System → Optional features → OpenSSH
+Server*, then `Start-Service sshd`):
+
+```
+dropq init lens                       # as usual (add --repo URL for commit jobs)
+dropq install                         # B's server must be running to run anything
+dropq pair laptop -p lens             # writes laptop.dropq and prints a one-time code
+```
+
+**On A** — needs the OpenSSH client (built into Windows 10+, macOS and most Linux):
+
+```
+dropq link laptop.dropq               # asks for the code; then deletes the file
+dropq install                         # A's server runs the relay
+dropq links                           # UP / DOWN, last contact, last error
+```
+
+A has to be able to reach B: on the same network, through a port forward, or — easiest — with
+[Tailscale](https://tailscale.com) on both (`dropq pair` uses B's Tailscale name when it has one;
+override with `--host`, `--user`, `--port` on either side).
+
+How the key works:
+
+- `dropq pair` makes a new key on B, adds it to B's `authorized_keys` locked to
+  `restrict,command="…agent.sh laptop"`, and writes it into the bundle encrypted with the code it
+  prints. So access starts with someone at B's keyboard, and a lost USB stick without the code is
+  useless. The bundle also pins B's host key, so A never has to trust anything on first connect.
+- The key can do nothing but talk to `dropq agent`: no shell, no port forwarding, and only the
+  projects named with `-p`. The agent writes jobs into B's inbox, and B's own server decides
+  whether they run, by B's rules.
+- `dropq keys` lists paired machines; `dropq keys revoke laptop` cuts one off at once (even
+  mid-connection). `--days N` makes a key expire. On A, `dropq unlink laptop` forgets the link.
+- On Windows, if your account is an administrator, sshd reads
+  `C:\ProgramData\ssh\administrators_authorized_keys` instead of your own `authorized_keys`;
+  `dropq pair` writes the right one (run it from an Administrator terminal in that case).
+
+On A, a remote project's `status.json` has a `remote` field (link up or down, last contact,
+last error, jobs waiting to be sent), and its `alive_at` is the last time A heard from a live
+server on B — so a dead link and a stopped server both look like a stale heartbeat. Artifacts
+land in `_jobs/artifacts/<ID>/` on A (up to 500 MB per job; `max_artifact_mb` in
+`_dropq/links/<name>/link.json`).
 
 ## Using it with an AI assistant
 
@@ -178,7 +258,8 @@ python -m pytest -q
 ```
 
 The tests start a real server on a temporary folder and drive it through the CLI, including
-the isolation rules.
+the isolation rules. The link tests run two servers on two folders and pair them for real
+(with `ssh-keygen`), but connect them through a local process instead of ssh.
 
 ## License
 

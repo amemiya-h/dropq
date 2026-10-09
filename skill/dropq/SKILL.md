@@ -37,7 +37,7 @@ not in your sandbox. Treat it like running commands on their computer: useful, b
    Then decide the next step and submit again — the loop closes without the user relaying.
 
 If `scripts/dq.py` is available next to this skill, it does all of this:
-`python dq.py <project>/_jobs status`, `submit --wait 600 -- python train.py`,
+`python dq.py <project>/_jobs status`, `submit --wait 600 [--commit SHA] [--artifact GLOB] -- python train.py`,
 `wait ID`, `show ID`, `list`, `cancel ID`.
 
 ## Job file
@@ -66,6 +66,27 @@ If `scripts/dq.py` is available next to this skill, it does all of this:
 - `shell: true` (cmd as a string) and `env` (extra environment variables) only work if the
   project's rules allow them — check `rules` in status.json first.
 - Always add a `note` saying what the job is for, so the user can follow along.
+
+### Optional fields
+
+- **commit**: run in a checkout of the project's git repo at this commit (only if `rules.repo`
+  is set). Commit and **push** first, then pass the full hash. The job's `cwd` is relative to
+  the checkout. This is how to run code you just wrote when the machine is remote.
+- **artifacts**: globs (relative to the job's folder) of output files to bring back when the
+  project is linked to another machine, e.g. `["results/*.csv", "plots/**/*.png"]`.
+- **not_after**: ISO time with offset; the job fails as expired instead of starting later.
+
+## Linked projects (jobs run on another machine)
+
+If `status.json` has a `remote` field, this inbox is relayed: jobs actually run on
+`remote.host`, and the relay mirrors status, running jobs, logs and results back here.
+
+- Check `remote.link_up` and `remote.server_alive`. If the link is down, jobs wait here
+  (`remote.waiting_to_send`) and are sent when it's back; tell the user rather than resubmit.
+- Files the job writes stay on the other machine. Only `log`, the result file and `artifacts`
+  come back — artifacts land in `_jobs/artifacts/<ID>/` (`artifacts_fetched` lists them).
+- Files you write into the project folder here are **not** visible to the job. Ship code via
+  git and `commit`, or keep scripts in the repo the other machine already has.
 
 ## Results
 
