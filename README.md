@@ -171,6 +171,33 @@ tied to exact code. Only the owner sets the repo; a job can only pick the commit
 the server user's own git credentials, e.g. a read-only deploy key for a private repo. Use the
 full hash when you can: then only that commit is fetched.
 
+## Services
+
+A project can have one long-running service that the server keeps alive, for example a dev
+manager or a small web UI that its sessions use. Only the owner sets it, in `projects.json`
+via `init`; a project's own files can never set the command.
+
+```
+dropq init NAME --service "python dev-manager/run.py serve"     # set (split like a shell would)
+dropq init NAME --no-service                                    # stop and clear
+```
+
+The command is resolved like a job's (`python` is the server's Python, other programs come from
+the server's `PATH` or are paths inside the project) and runs with the project folder as its
+working directory and `DROPQ_SERVICE=1` and `DROPQ_PROJECT=NAME` in its environment. If it exits,
+the server logs `service NAME: exited rc=N` and restarts it after 5 s, doubling each time it
+dies within 60 s of starting (at most 300 s); a run of 60 s or more resets that. Disabling the
+project, clearing the service or stopping the server stops it.
+
+To restart it on demand, for example after editing its code, create `NAME/_jobs/service.restart`.
+The server deletes the file and restarts the service at once, without any backoff.
+
+Output goes to `NAME/_jobs/logs/service.log` (moved to `service.log.1` when it passes 5 MB at a
+start). `_jobs/status.json` and the server's `status.json` carry
+`"service": {"cmd", "state": "running"|"backoff"|"stopped", "pid", "since", "restarts", "last_exit"}`
+(`null` without a service), `dropq status` prints one line per service, and `dropq projects`
+shows the command.
+
 ## Running jobs on another machine
 
 Run dropq on both machines. On **B** (the one with the GPU) projects work as usual. On **A**

@@ -254,3 +254,119 @@ def test_clean_stop_is_reported(tmp_path):
     assert "STOPPED" in cli(tmp_path, "monitor", "--once").stdout
     assert "STOPPED" in cli(tmp_path, "status", check=False).stdout
     assert "STOPPED" in dq(str(tmp_path / "proj"), "status").stdout
+
+
+# ---------------------------------------------------------------- services
+SERVICE = "python -c \"import time,os;open('started-'+str(os.getpid()),'w').close();time.sleep(600)\""
+
+
+def svc_status(root, project="svc"):
+    try:
+        return json.loads((root / project / "_jobs" / "status.json").read_text(encoding="utf-8")).get("service")
+    except (OSError, ValueError):
+        return None
+
+
+def wait_for(cond, timeout=15, what="condition"):
+    t0 = time.time()
+    while True:
+        v = cond()
+        if v:
+            return v
+        assert time.time() - t0 < timeout, f"timed out waiting for {what}"
+        time.sleep(0.1)
+
+
+def alive(pid):
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def started(root):
+    return sorted(p.name for p in (root / "svc").glob("started-*"))
+
+
+@pytest.fixture
+def svc_server(tmp_path):
+    cli(tmp_path, "init", "svc", "--service", SERVICE)
+    proc = subprocess.Popen([sys.executable, DROPQ, "--root", str(tmp_path), "serve"], env=ENV,
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    yield tmp_path, proc
+    if proc.poll() is None:
+        proc.terminate()
+    proc.wait(timeout=15)
+    s = svc_status(tmp_path)
+    if s and s.get("pid") and alive(s["pid"]):
+        os.kill(s["pid"], 9)
+
+
+def running_pid(root):
+    s = svc_status(root)
+    return s and s["state"] == "running" and s["pid"]
+
+
+def test_service_starts(svc_server):
+    root, _ = svc_server
+    pid = wait_for(lambda: running_pid(root), what="service running")
+    wait_for(lambda: len(started(root)) == 1, what="started file")
+    assert started(root) == [f"started-{pid}"]
+    assert svc_status(root)["restarts"] == 0
+    assert "service" in cli(root, "projects").stdout
+    assert "service svc: running" in cli(root, "status").stdout
+
+
+def test_service_restarts_after_crash(svc_server):
+    root, _ = svc_server
+    pid = wait_for(lambda: running_pid(root))
+    os.kill(pid, 9)
+    new = wait_for(lambda: (p := running_pid(root)) and p != pid and p, timeout=20, what="restart")
+    s = svc_status(root)
+    assert s["restarts"] == 1 and s["last_exit"] is not None
+    wait_for(lambda: f"started-{new}" in started(root))
+    assert len(started(root)) == 2
+
+
+def test_service_restart_request(svc_server):
+    root, _ = svc_server
+    pid = wait_for(lambda: running_pid(root))
+    flag = root / "svc" / "_jobs" / "service.restart"
+    flag.write_text("")
+    new = wait_for(lambda: (p := running_pid(root)) and p != pid and p, what="restart")
+    assert not flag.exists()
+    wait_for(lambda: not alive(pid), what="old process gone")
+    assert svc_status(root)["restarts"] == 1
+
+
+def test_service_that_exits_goes_to_backoff(tmp_path):
+    cli(tmp_path, "init", "svc", "--service", 'python -c "import sys;sys.exit(3)"')
+    proc = subprocess.Popen([sys.executable, DROPQ, "--root", str(tmp_path), "serve"], env=ENV,
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        wait_for(lambda: (svc_status(tmp_path) or {}).get("state") == "backoff", what="backoff")
+        assert svc_status(tmp_path)["last_exit"] == 3
+        time.sleep(4)
+        s = svc_status(tmp_path)
+        assert s["restarts"] == 0 and s["state"] == "backoff"
+    finally:
+        proc.terminate()
+        proc.wait(timeout=15)
+
+
+def test_no_service_stops_it(svc_server):
+    root, _ = svc_server
+    pid = wait_for(lambda: running_pid(root))
+    cli(root, "init", "svc", "--no-service")
+    wait_for(lambda: not alive(pid), what="service killed")
+    wait_for(lambda: svc_status(root) is None, what="service cleared from status")
+
+
+def test_stopping_server_kills_service(svc_server):
+    root, proc = svc_server
+    pid = wait_for(lambda: running_pid(root))
+    proc.terminate()
+    proc.wait(timeout=15)
+    wait_for(lambda: not alive(pid), what="service killed")
+    assert svc_status(root)["state"] == "stopped"

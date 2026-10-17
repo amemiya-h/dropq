@@ -30,7 +30,10 @@ else the current directory.
   dropq init NAME [rules]              create/register project NAME (or update its rules)
       --shell/--no-shell  --env/--no-env  --background/--no-background
       --commands python git ...  (allowed programs; --any-command to lift)
-      --max-timeout SEC   --max-queued N
+      --max-timeout SEC   --max-queued N   --repo URL
+      --service "CMD ARGS"  a long-running process the server keeps alive in the project folder
+                          (restarted if it dies; touch _jobs/service.restart to restart it)
+      --no-service        stop and clear the service
   dropq enable NAME / disable NAME     disabled projects keep their queue but nothing starts
   dropq projects                       list projects and rules
   dropq serve                          run the server in the foreground (Ctrl+C to stop)
@@ -68,9 +71,9 @@ Give a project's inbox only to people and tools you would let run code as that u
 untrusted code use a separate OS account, a VM or a container.
 """
 import argparse, base64, datetime as dt, getpass, glob, json, os, re, secrets, shutil, signal, socket
-import subprocess, sys, tempfile, threading, time, uuid
+import shlex, subprocess, sys, tempfile, threading, time, uuid
 
-__version__ = "0.5.0"
+__version__ = "0.6.0"
 WIN = os.name == "nt"
 POLL = float(os.environ.get("DROPQ_POLL", "2"))   # seconds between server checks
 DEFAULT_TIMEOUT = 6 * 3600
@@ -79,7 +82,8 @@ NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 INBOX_DIRS = ("queue", "running", "done", "logs", "cancel")
 DEFAULT_RULES = dict(enabled=True, allow_shell=False, allow_env=False, allow_background=True,
-                     commands=None, max_timeout_s=None, max_queued=100, repo=None, remote=None)
+                     commands=None, max_timeout_s=None, max_queued=100, repo=None, remote=None,
+                     service=None)
 SHA_RE = re.compile(r"^[0-9a-fA-F]{7,64}$")
 NOWIN = subprocess.CREATE_NO_WINDOW if WIN else 0
 
@@ -486,6 +490,100 @@ def recover(project):
         os.remove(os.path.join(rdir, f))
 
 
+SERVICE_QUICK_S = 60            # a run shorter than this counts as a quick exit
+SERVICE_LOG_MAX = 5 * 1024 * 1024
+
+
+class Service:
+    """A project's supervised long-running process (rules["service"]); owned by serve()."""
+
+    def __init__(self, project, cmd):
+        self.project, self.cmd = project, cmd
+        self.proc = None
+        self.state, self.since = "stopped", now()
+        self.restarts, self.quick, self.last_exit = 0, 0, None
+        self.t0, self.next_start, self.started_once = 0.0, 0.0, False
+
+    def _set(self, state):
+        self.state, self.since = state, now()
+
+    def start(self, rules):
+        logdir = inbox(self.project, "logs")
+        log = os.path.join(logdir, "service.log")
+        try:
+            if os.path.getsize(log) > SERVICE_LOG_MAX:
+                os.replace(log, log + ".1")
+        except OSError:
+            pass
+        try:
+            rl = dict(rules, commands=None, allow_shell=False)
+            cwd, cmd = check_job(self.project, {"cmd": self.cmd}, rl)[:2]
+            env = dict(os.environ, DROPQ_SERVICE="1", DROPQ_PROJECT=self.project)
+            logf = open(log, "ab")
+        except (Rejected, OSError) as e:
+            self._failed(f"could not start: {e}")
+            return
+        try:
+            logf.write(f"### {now()} service start {cmd}\n".encode()); logf.flush()
+            kw = dict(cwd=cwd, env=env, stdout=logf, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL)
+            if WIN:
+                kw["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW
+            else:
+                kw["start_new_session"] = True
+            self.proc = subprocess.Popen(cmd, **kw)
+        except OSError as e:
+            self._failed(f"could not start: {e}")
+            return
+        finally:
+            logf.close()
+        if self.started_once:
+            self.restarts += 1
+        self.started_once, self.t0 = True, time.time()
+        self._set("running")
+        say(f"service {self.project}: started pid {self.proc.pid}")
+
+    def _failed(self, msg):
+        say(f"service {self.project}: {msg}")
+        self.last_exit = None
+        self._backoff()
+
+    def _backoff(self):
+        self.next_start = time.time() + min(300, 5 * 2 ** self.quick)
+        self.quick += 1
+        self.proc = None
+        self._set("backoff")
+
+    def stop(self):
+        if self.proc is not None:
+            kill_tree(self.proc); self.proc.wait()
+            self.proc = None
+        if self.state != "stopped":
+            self._set("stopped")
+        self.next_start = 0.0
+
+    def tick(self, rules):
+        flag = os.path.join(inbox(self.project), "service.restart")
+        if os.path.exists(flag):
+            _remove(flag)
+            say(f"service {self.project}: restart requested")
+            self.stop(); self.quick = 0
+            self.start(rules)
+            return
+        if self.proc is None:
+            if time.time() >= self.next_start:
+                self.start(rules)
+        elif self.proc.poll() is not None:
+            self.last_exit = self.proc.returncode
+            say(f"service {self.project}: exited rc={self.last_exit}")
+            if time.time() - self.t0 >= SERVICE_QUICK_S:
+                self.quick = 0
+            self._backoff()
+
+    def summary(self):
+        return dict(cmd=self.cmd, state=self.state, pid=self.proc.pid if self.proc else None,
+                    since=self.since, restarts=self.restarts, last_exit=self.last_exit)
+
+
 def _sigterm(signum, frame):
     raise KeyboardInterrupt
 
@@ -497,6 +595,7 @@ def serve():
         say(f"dropq {__version__} serving {ROOT} (python {sys.executable})")
         server_started = now()
         recovered, running, preps, relays, gpu, gpu_t = set(), [], [], {}, None, 0.0
+        services = {}
         try:
             while True:
                 reg = load_registry()
@@ -513,6 +612,21 @@ def serve():
                 for name in wanted - set(relays):
                     if os.path.exists(os.path.join(LINKS, name, "link.json")):
                         relays[name] = Relay(name, [p for p in reg if reg[p]["remote"] == name])
+                # supervised services
+                for p in list(services):
+                    if p not in active or not reg[p]["service"]:
+                        services.pop(p).stop()
+                for p in active:
+                    cmd = reg[p]["service"]
+                    if not cmd:
+                        continue
+                    if p in services and services[p].cmd != cmd:
+                        services.pop(p).stop()
+                    sv = services.setdefault(p, Service(p, cmd))
+                    if reg[p]["enabled"]:
+                        sv.tick(reg[p])
+                    else:
+                        sv.stop()
                 # finished, cancelled, timed out
                 for r in list(running):
                     if os.path.exists(os.path.join(inbox(r.project, "cancel"), r.jid)):
@@ -624,7 +738,9 @@ def serve():
                         alive_at=stamp, started_at=server_started, pid=os.getpid(), root=ROOT,
                         python=sys.executable, version=__version__, poll_s=POLL, running=jobs,
                         queued=[f"{p}/{j}" for _, p, j in sorted(i for p in active for i in queued(p))],
-                        projects={p: dict(enabled=reg[p]["enabled"], remote=reg[p]["remote"]) for p in reg},
+                        projects={p: dict(enabled=reg[p]["enabled"], remote=reg[p]["remote"],
+                                          service=services[p].summary() if p in services else None)
+                                  for p in reg},
                         links={n: rl.summary() for n, rl in relays.items()}, gpu=gpu), tries=1)
                 except OSError:
                     pass
@@ -636,6 +752,7 @@ def serve():
                                           **({"preparing": True} if j.get("preparing") else {}))
                                      for j in jobs if j["project"] == p],
                             queued=[j for _, _, j in sorted(queued(p))], gpu=gpu,
+                            service=services[p].summary() if p in services else None,
                             rules={k: v for k, v in reg[p].items() if k not in ("enabled", "remote")}), tries=1)
                     except OSError:
                         pass
@@ -646,6 +763,8 @@ def serve():
                 rl.stop()
             for r in running:
                 kill_tree(r.proc); r.proc.wait(); finish(r, "interrupted", r.proc.returncode)
+            for sv in services.values():
+                sv.stop()
             for pr in preps:
                 _remove(os.path.join(inbox(pr.project, "running"), pr.jid + ".json"))
                 reject(pr.project, pr.jid, pr.job, "server stopped during the checkout", "interrupted")
@@ -654,6 +773,9 @@ def serve():
                 try:
                     st = read_json(path)
                     st.update(stopped_at=stop, running=[])
+                    for holder in [st] + list((st.get("projects") or {}).values()):
+                        if holder.get("service"):
+                            holder["service"].update(state="stopped", pid=None)
                     write_json(path, st)
                 except Exception:  # noqa: BLE001
                     pass
@@ -689,6 +811,16 @@ def init(a):
         rules["max_queued"] = a.max_queued
     if a.repo is not None:
         rules["repo"] = a.repo or None
+    if a.service is not None:
+        try:
+            cmd = shlex.split(a.service, posix=not WIN)
+        except ValueError as e:
+            sys.exit(f"--service: {e}")
+        if not cmd:
+            sys.exit("--service needs a command")
+        rules["service"] = cmd
+    elif a.no_service:
+        rules["service"] = None
     new = a.name not in reg
     reg[a.name] = rules
     os.makedirs(os.path.join(ROOT, a.name), exist_ok=True)
@@ -706,7 +838,8 @@ def print_rules(name, r):
     mt = "none" if r["max_timeout_s"] is None else f"{r['max_timeout_s']}s"
     print(f"  {name:20s} {'enabled ' if r['enabled'] else 'DISABLED'} shell={yn(r['allow_shell'])} "
           f"env={yn(r['allow_env'])} background={yn(r['allow_background'])} programs={cmds} "
-          f"max_timeout={mt} max_queued={r['max_queued']}" + (f" repo={r['repo']}" if r.get("repo") else ""))
+          f"max_timeout={mt} max_queued={r['max_queued']}" + (f" repo={r['repo']}" if r.get("repo") else "")
+          + (f" service={' '.join(r['service'])}" if r.get("service") else ""))
 
 
 def set_enabled(a, value):
@@ -1635,6 +1768,11 @@ def status(a):
     for r in s["running"]:
         print(f"running: {r['project']}/{r['id']} {'[bg] ' if r['background'] else ''}{r['elapsed_s']}s")
     print("queued:", ", ".join(s["queued"]) or "none")
+    for n, pr in sorted((s.get("projects") or {}).items()):
+        sv = pr.get("service")
+        if sv:
+            print(f"service {n}: {sv['state']} pid={sv['pid']} restarts={sv['restarts']} "
+                  f"last_exit={sv['last_exit']} since {sv['since']} | {' '.join(sv['cmd'])}")
     for n, l in sorted((s.get("links") or {}).items()):
         print(f"link {n}: {'UP' if l.get('up') else 'DOWN'} -> {l.get('host')} ({', '.join(l.get('projects', []))})"
               + ("" if l.get("up") or not l.get("error") else f"  {l['error']}"))
@@ -2292,6 +2430,9 @@ def main(argv=None):
     p.add_argument("--max-timeout", type=int, help="seconds; 0 = no cap")
     p.add_argument("--max-queued", type=int)
     p.add_argument("--repo", metavar="URL", help="git repo that commit jobs check out (\"\" to clear)")
+    g = p.add_mutually_exclusive_group()
+    g.add_argument("--service", metavar="CMD", help="command the server keeps running in the project folder")
+    g.add_argument("--no-service", action="store_true", help="stop and clear the service")
     for c in ("enable", "disable"):
         sp.add_parser(c).add_argument("name")
     p = sp.add_parser("submit")
